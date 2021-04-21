@@ -69,10 +69,13 @@ object IOAsync {
         // format: off
         q"""
           final class $name(dispatcher: _root_.cats.effect.std.Dispatcher[IO], callback: _root_.cats.effect.std.IOAsync.Callback) extends _root_.cats.effect.std.IOStateMachine(dispatcher, callback) {
-            ${mark(q"""override def apply(tr$$async: _root_.scala.Either[_root_.scala.Throwable, _root_.scala.AnyRef]): _root_.scala.Unit = ${body}""")}
+            ${mark(q"""override def apply(tr$$async: _root_.cats.effect.kernel.Outcome[_root_.cats.effect.IO, _root_.scala.Throwable, _root_.scala.AnyRef]): _root_.scala.Unit = ${body}""")}
           }
           _root_.cats.effect.std.Dispatcher[IO].use { dispatcher =>
             _root_.cats.effect.IO.async_[_root_.scala.AnyRef](cb => new $name(dispatcher, cb).start())
+          }.handleErrorWith {
+            case _root_.cats.effect.std.IOAsync.CancelBridge => _root_.cats.effect.IO.canceled
+            case _root_.scala.util.control.NonFatal(other) => _root_.cats.effect.IO.raiseError(other)
           }.asInstanceOf[${c.macroApplication.tpe}]
         """
       } catch {
@@ -83,15 +86,18 @@ object IOAsync {
           )
       }
   }
+
+  // A marker exception to communicate cancellation through the async runtime.
+  object CancelBridge extends Throwable with scala.util.control.NoStackTrace
 }
 
 abstract class IOStateMachine(
     dispatcher: Dispatcher[IO],
     callback: IOAsync.Callback
-) extends Function1[Either[Throwable, AnyRef], Unit] {
+) extends Function1[Outcome[IO, Throwable, AnyRef], Unit] {
 
   // FSM translated method
-  //def apply(v1: Either[Throwable, AnyRef]): Unit = ???
+  //def apply(v1: Outcome[IO, Throwable, AnyRef]): Unit = ???
 
   private[this] var state$async: Int = 0
 
@@ -104,24 +110,28 @@ abstract class IOStateMachine(
   protected def completeFailure(t: Throwable): Unit =
     callback(Left(t))
 
-  protected def completeSuccess(value: AnyRef): Unit =
+  protected def completeSuccess(value: AnyRef): Unit = {
     callback(Right(value))
-
-  protected def onComplete(f: IO[AnyRef]): Unit = {
-    dispatcher.unsafeRunAndForget(f.attempt.flatMap(either => IO(this(either))))
   }
 
-  protected def getCompleted(f: IO[AnyRef]): Either[Throwable, AnyRef] = {
+  protected def onComplete(f: IO[AnyRef]): Unit = {
+    dispatcher.unsafeRunAndForget(f.guaranteeCase(outcome => IO(this(outcome))))
+  }
+
+  protected def getCompleted(f: IO[AnyRef]): Outcome[IO, Throwable, AnyRef] = {
     null
   }
 
-  protected def tryGet(tr: Either[Throwable, AnyRef]): AnyRef =
+  protected def tryGet(tr: Outcome[IO, Throwable, AnyRef]): AnyRef =
     tr match {
-      case Right(value) =>
-        value.asInstanceOf[AnyRef]
-      case Left(throwable) =>
-        callback(Left(throwable))
+      case Outcome.Succeeded(value) =>
+        dispatcher.unsafeRunSync(value)
+      case Outcome.Errored(e) =>
+        callback(Left(e))
         this // sentinel value to indicate the dispatch loop should exit.
+      case Outcome.Canceled() =>
+        callback(Left(IOAsync.CancelBridge))
+        this
     }
 
   def start(): Unit = {
