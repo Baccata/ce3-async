@@ -6,6 +6,7 @@ import cats.effect.std.IOAsync._
 import scala.concurrent.duration._
 import cats.syntax.all._
 import cats.effect.kernel.Outcome
+import cats.effect.kernel.Ref
 
 class HelloWorldSuite extends CatsEffectSuite {
 
@@ -36,5 +37,18 @@ class HelloWorldSuite extends CatsEffectSuite {
     val expected = Outcome.canceled[IO, Throwable, Unit]
 
     foobar.start.flatMap(_.join).map(outcome => assertEquals(outcome, expected))
+  }
+
+  test("The Async block is cancellable") {
+    for {
+      ref <- Ref[IO].of(0)
+      _ <- async {
+        await(IO.sleep(1.second) *> ref.update(_ + 1))
+      }.start.flatMap(_.cancel)
+      _ <- IO.sleep(2.second)
+      result <- ref.get
+    } yield {
+      assertEquals(result, 0)
+    }
   }
 }
