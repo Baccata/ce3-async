@@ -1,31 +1,27 @@
 package cats.effect.std
 
-import java.util.Objects
-
-import scala.util.{Failure, Success, Try}
-import cats.effect.std.Dispatcher
-import cats.effect.IO
-import cats.effect.kernel.Outcome
-import cats.effect.kernel.Outcome.Canceled
-import cats.effect.kernel.Outcome.Errored
-import cats.effect.kernel.Outcome.Succeeded
-import java.util.concurrent.CancellationException
-
-import language.experimental.macros
-import scala.annotation.compileTimeOnly
-import scala.reflect.macros.blackbox
 import scala.annotation.compileTimeOnly
 import scala.reflect.macros.whitebox
-import cats.syntax
+// import language.experimental.macros
 
-object IOAsync {
+import cats.effect.std.Dispatcher
+import cats.effect.kernel.Outcome
+import cats.effect.kernel.Sync
+import cats.effect.kernel.Async
+import cats.effect.syntax.all._
+import cats.effect.IO
 
-  type Callback = Either[Throwable, AnyRef] => Unit
+object IOAsync extends AsyncAwaitDsl[IO]
 
-  /** Run the block of code `body` asynchronously. `body` may contain calls to `await` when the results of
-    * a `Future` are needed; this is translated into non-blocking code.
+class AsyncAwaitDsl[F[_]](implicit F: Async[F]) {
+
+  /** Type member used by the macro expansion to recover what `F` is without typetags
     */
-  def async[T](body: => T): IO[T] = macro asyncImpl[T]
+  type _AsyncContext[A] = F[A]
+
+  /** Value member used by the macro expansion to recover the Async instance associated to the block.
+    */
+  implicit val _AsyncInstance: Async[F] = F
 
   /** Non-blocking await the on result of `awaitable`. This may only be used directly within an enclosing `async` block.
     *
@@ -33,10 +29,23 @@ object IOAsync {
     * in the `onComplete` handler of `awaitable`, and will *not* block a thread.
     */
   @compileTimeOnly("[async] `await` must be enclosed in an `async` block")
-  def await[T](awaitable: IO[T]): T =
+  def await[T](awaitable: F[T]): T =
     ??? // No implementation here, as calls to this are translated to `onComplete` by the macro.
 
-  def asyncImpl[T: c.WeakTypeTag](c: whitebox.Context)(body: c.Tree): c.Tree = {
+  /** Run the block of code `body` asynchronously. `body` may contain calls to `await` when the results of
+    * a `Future` are needed; this is translated into non-blocking code.
+    */
+  def async[T](body: => T): F[T] = macro AsyncAwaitDsl.asyncImpl[F, T]
+
+}
+
+object AsyncAwaitDsl {
+
+  type Callback = Either[Throwable, AnyRef] => Unit
+
+  def asyncImpl[F[_], T](
+      c: whitebox.Context
+  )(body: c.Tree): c.Tree = {
     import c.universe._
     if (!c.compilerSettings.contains("-Xasync")) {
       c.abort(
@@ -45,7 +54,7 @@ object IOAsync {
       )
     } else
       try {
-        val awaitSym = typeOf[IOAsync.type].decl(TermName("await"))
+        val awaitSym = typeOf[AsyncAwaitDsl[Any]].decl(TermName("await"))
         def mark(t: DefDef): Tree = {
           import language.reflectiveCalls
           c.internal
@@ -68,14 +77,16 @@ object IOAsync {
         val name = TypeName("stateMachine$async")
         // format: off
         q"""
-          final class $name(dispatcher: _root_.cats.effect.std.Dispatcher[IO], callback: _root_.cats.effect.std.IOAsync.Callback) extends _root_.cats.effect.std.IOStateMachine(dispatcher, callback) {
-            ${mark(q"""override def apply(tr$$async: _root_.cats.effect.kernel.Outcome[_root_.cats.effect.IO, _root_.scala.Throwable, _root_.scala.AnyRef]): _root_.scala.Unit = ${body}""")}
+          final class $name(dispatcher: _root_.cats.effect.std.Dispatcher[${c.prefix}._AsyncContext], callback: _root_.cats.effect.std.AsyncAwaitDsl.Callback) extends _root_.cats.effect.std.AsyncAwaitStateMachine(dispatcher, callback) {
+            ${mark(q"""override def apply(tr$$async: _root_.cats.effect.kernel.Outcome[${c.prefix}._AsyncContext, _root_.scala.Throwable, _root_.scala.AnyRef]): _root_.scala.Unit = ${body}""")}
           }
-          _root_.cats.effect.std.Dispatcher[IO].use { dispatcher =>
-            _root_.cats.effect.IO.async_[_root_.scala.AnyRef](cb => new $name(dispatcher, cb).start())
-          }.handleErrorWith {
-            case _root_.cats.effect.std.IOAsync.CancelBridge => _root_.cats.effect.IO.canceled
-            case _root_.scala.util.control.NonFatal(other) => _root_.cats.effect.IO.raiseError(other)
+          ${c.prefix}._AsyncInstance.recoverWith {
+            _root_.cats.effect.std.Dispatcher[${c.prefix}._AsyncContext].use { dispatcher =>
+              ${c.prefix}._AsyncInstance.async_[_root_.scala.AnyRef](cb => new $name(dispatcher, cb).start())
+            }
+          }{
+            case _root_.cats.effect.std.AsyncAwaitDsl.CancelBridge =>
+              ${c.prefix}._AsyncInstance.map(${c.prefix}._AsyncInstance.canceled)(_ => null.asInstanceOf[AnyRef])
           }.asInstanceOf[${c.macroApplication.tpe}]
         """
       } catch {
@@ -91,10 +102,10 @@ object IOAsync {
   object CancelBridge extends Throwable with scala.util.control.NoStackTrace
 }
 
-abstract class IOStateMachine(
-    dispatcher: Dispatcher[IO],
-    callback: IOAsync.Callback
-) extends Function1[Outcome[IO, Throwable, AnyRef], Unit] {
+abstract class AsyncAwaitStateMachine[F[_]](
+    dispatcher: Dispatcher[F],
+    callback: AsyncAwaitDsl.Callback
+)(implicit F: Sync[F]) extends Function1[Outcome[F, Throwable, AnyRef], Unit] {
 
   // FSM translated method
   //def apply(v1: Outcome[IO, Throwable, AnyRef]): Unit = ???
@@ -114,15 +125,16 @@ abstract class IOStateMachine(
     callback(Right(value))
   }
 
-  protected def onComplete(f: IO[AnyRef]): Unit = {
-    dispatcher.unsafeRunAndForget(f.guaranteeCase(outcome => IO(this(outcome))))
+  protected def onComplete(f: F[AnyRef]): Unit = {
+    dispatcher.unsafeRunAndForget(f.guaranteeCase(outcome => F.delay(this(outcome))))
   }
 
-  protected def getCompleted(f: IO[AnyRef]): Outcome[IO, Throwable, AnyRef] = {
+  protected def getCompleted(f: F[AnyRef]): Outcome[F, Throwable, AnyRef] = {
+    val _ = f
     null
   }
 
-  protected def tryGet(tr: Outcome[IO, Throwable, AnyRef]): AnyRef =
+  protected def tryGet(tr: Outcome[F, Throwable, AnyRef]): AnyRef =
     tr match {
       case Outcome.Succeeded(value) =>
         dispatcher.unsafeRunSync(value)
@@ -130,11 +142,12 @@ abstract class IOStateMachine(
         callback(Left(e))
         this // sentinel value to indicate the dispatch loop should exit.
       case Outcome.Canceled() =>
-        callback(Left(IOAsync.CancelBridge))
+        callback(Left(AsyncAwaitDsl.CancelBridge))
         this
     }
 
   def start(): Unit = {
+    // Required to kickstart the async state machine.
     // `def apply` does not consult its argument when `state == 0`.
     apply(null)
   }

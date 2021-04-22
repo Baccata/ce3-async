@@ -1,6 +1,6 @@
 package com.example
 
-import cats.effect.{IO, SyncIO}
+import cats.effect.IO
 import munit.CatsEffectSuite
 import cats.effect.std.IOAsync._
 import scala.concurrent.duration._
@@ -51,4 +51,13 @@ class HelloWorldSuite extends CatsEffectSuite {
       assertEquals(result, 0)
     }
   }
+
+  test("side effects in the async block are suspended") {
+    var x = 0
+
+    val io = async { x += 1; await(IO(x)) }
+
+    IO(assertEquals(x, 0)) *> io *> IO(assertEquals(x, 1))
+  }
+
 }
